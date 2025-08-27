@@ -1,18 +1,19 @@
 import time
 import board
 import touchio
-import audiobusio
-import array
+import adafruit_max9744 # pyright: ignore[reportMissingImports]
 import math
-import adafruit_max9744
-import audiocore
 import busio
 import analogio
+import audiobusio
+import array
+from audiocore import RawSample
+
 
 
 # Define o pino para o sensor de capacitância
 capacitance_pin = board.A2
-# Define o pino para a saída de frequência
+# Define o pino para a saída do tom
 sound_output = board.D7
 # Define o pino para o potenciômetro
 potentiometer_pin = board.A1
@@ -28,9 +29,10 @@ except ValueError as e:
     print(f"Error initializing amplifier: {e}")
     print("Make sure the amplifier is properly connected via I2C.")
     amp = None 
+    
+
 
 # --- Fim da Configuração do Amplificador ---
-
 
 # Inicializa o sensor de toque
 touch_sensor = touchio.TouchIn(capacitance_pin)
@@ -60,22 +62,28 @@ CALIBRATION_NONE_CONNECTED = 0
 CALIBRATION_TOUCH_THRESHOLD_VALUE = 0
 
 
-# --- Variáveis de Geração de Frequência ---
-FREQUENCY = 16  # Hz
-PERIOD = 1.0 / FREQUENCY
-HALF_PERIOD = PERIOD / 2.0
+# --- Variáveis de Geração de Frequência CORRIGIDAS ---
+FREQUENCY = 16 # Hz - Mudei para 40Hz (mais audível que 16Hz)
+tone_volume = 0.1  # Reduzi o volume para evitar clipping
+sample_rate = 22050  # Sample rate mais alto para melhor qualidade
+length = sample_rate // FREQUENCY  # Samples por ciclo
 
-bclk = board.D8
-lrclk = board.D10
-sRate = 8e3
-length = sRate // FREQUENCY
-volume = 0.5
+# Gerar sine wave mais limpa
 sine_wave = array.array("h", [0] * length)
 for i in range(length):
-    sine_wave[i] = int((1 + math.sin(math.pi * 2 * i / length)) * volume * (2**15 - 1))
+    # Usar math.sin com fase correta e amplitude adequada
+    phase = 2.0 * math.pi * i / length
+    amplitude = int(tone_volume * (2**15 - 1))  # 16-bit signed max
+    sine_wave[i] = int(math.sin(phase) * amplitude)
 
-audio = audiocore.RawSample(sine_wave, sample_rate=sRate)
-i2s = audiobusio.I2SOut(bclk, lrclk, sound_output)
+# Configuração I2S
+bclk = board.D8    
+lrclk = board.D10
+audio = audiobusio.I2SOut(bclk, lrclk, sound_output)
+sine_wave_sample = RawSample(sine_wave, sample_rate=sample_rate)
+
+# Variável para controlar reprodução de áudio
+audio_playing = False
 
 def auto_calibrate():
     global CALIBRATION_NONE_CONNECTED, CALIBRATION_TOUCH_THRESHOLD_VALUE
@@ -104,9 +112,8 @@ def auto_calibrate():
 
 
 def calculate_capacitance_from_touchio(raw_value, touch_multiplier):
-
-    #Aproxima a capacitância com base no valor bruto do touchio usando escalonamento linear
-    #em relação à linha de base calibrada e a um limite de toque ajustável.
+    """Aproxima a capacitância com base no valor bruto do touchio usando escalonamento linear
+    em relação à linha de base calibrada e a um limite de toque ajustável."""
  
     global CALIBRATION_TOUCH_THRESHOLD_VALUE
     
@@ -130,6 +137,7 @@ def calculate_capacitance_from_touchio(raw_value, touch_multiplier):
 
 
 def main():
+    global audio_playing
 
     print("Medidor de Capacitância com Controle de Sensibilidade por Potenciômetro")
     try:
@@ -143,44 +151,52 @@ def main():
 
     while True:
         # --- Leitura do Potenciômetro ---
-        # O valor bruto vai de 0 a 65535. Mapeie para a faixa de sensibilidade desejada.
         pot_value = potentiometer.value
         touch_multiplier = ((pot_value / 65535) * (MAX_MULTIPLIER - MIN_MULTIPLIER)) + MIN_MULTIPLIER
         
         # --- Leitura do Sensor de Capacitância ---
         raw_value = touch_sensor.raw_value
-        time.sleep(DEBOUNCE_TIME)
         approx_capacitance_pf = calculate_capacitance_from_touchio(raw_value, touch_multiplier)
 
+        # --- Controle de Reprodução de Áudio ---
+        should_play_audio = approx_capacitance_pf > 1.0  # Threshold para tocar áudio
+        
+        if should_play_audio and not audio_playing:
+            # Começar a tocar áudio
+            audio.play(sine_wave_sample, loop=True)
+            audio_playing = True
+            print("Áudio iniciado")
+        elif not should_play_audio and audio_playing:
+            # Parar áudio
+            audio.stop()
+            audio_playing = False
+            print("Áudio parado")
+
         # --- Ajuste de Volume do Amplificador ---
-        if amp:
-            min_cap_for_volume = 0.0
+        if amp and audio_playing:
+            min_cap_for_volume = 1.0  # Capacitância mínima para volume
             max_cap_for_volume = CALIBRATION_MAX_CAP_PF
             if max_cap_for_volume == min_cap_for_volume:
-                volume = 0
+                volume = 0  
             else:
-                volume_float = (approx_capacitance_pf - min_cap_for_volume) / (max_cap_for_volume - min_cap_for_volume) * 63.0
-                volume = int(max(0, min(63, volume_float)))
-
+                volume_float = (approx_capacitance_pf - min_cap_for_volume) / (max_cap_for_volume - min_cap_for_volume) * 30.0
+                volume = int(max(0, min(63, volume_float)))  
+        
             try:
                 amp.volume = volume
-                print(f"Potenciômetro: {pot_value} (Multiplicador: {touch_multiplier:.2f}), Capacitância: {approx_capacitance_pf:.2f} pF, Volume: {volume}")
+                print(f"Pot: {pot_value} (Mult: {touch_multiplier:.2f}), Cap: {approx_capacitance_pf:.2f} pF, Vol: {volume}")
             except Exception as e:
                 print(f"Erro ao definir o volume: {e}")
                 print(f"Capacitância: {approx_capacitance_pf:.2f} pF")
         else:
-            print(f"Potenciômetro: {pot_value} (Multiplicador: {touch_multiplier:.2f}), Capacitância: {approx_capacitance_pf:.2f} pF (Amplificador não conectado)")
+            if not amp:
+                print(f"Pot: {pot_value} (Mult: {touch_multiplier:.2f}), Cap: {approx_capacitance_pf:.2f} pF (Amp desconectado)")
+            else:
+                print(f"Pot: {pot_value} (Mult: {touch_multiplier:.2f}), Cap: {approx_capacitance_pf:.2f} pF (Sem áudio)")
 
-        # --- Geração de Frequência Não Bloqueadora ---
-        """current_time = time.monotonic()
-        if (current_time - last_frequency_toggle_time) >= HALF_PERIOD:
-            frequency_port.value = not frequency_port.value
-            last_frequency_toggle_time = current_time
-        """
-        i2s.play(audio, loop=True)
-        # --- End Frequency Generation ---
+        # Pequena pausa para não sobrecarregar o processador
+        time.sleep(0.1)
+
 
 if __name__ == "__main__":
     main()
-    
-""""""
